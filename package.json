@@ -56,6 +56,14 @@
     "zod": "^4.3.5",
     "zod-to-json-schema": "^3.24.6"
   },
+  "overrides": {
+    "chalk": "^4.1.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "chalk": "^4.1.2"
+    }
+  },
   "devDependencies": {
     "@shareai-lab/kode-sdk": "file:.",
     "@types/better-sqlite3": "^7.6.13",
