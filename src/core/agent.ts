@@ -153,6 +153,19 @@ export interface SubscribeOptions {
   kinds?: Array<AgentEvent['type']>;
 }
 
+/**
+ * 工具集动态变更事件（PR-1）。
+ * 由 addTools/removeTools 产生，由 flushToolMutations 消费（R-02 call point）。
+ *
+ * 设计原则：纯数据，不引用 ToolInstance / ToolDescriptor，确保跨进程 / 跨 history 序列化安全。
+ */
+export interface PendingToolMutation {
+  op: 'add' | 'remove';
+  names: string[];
+  /** epoch milliseconds, Agent 内部时钟。仅用作排序，不做强时序保证。 */
+  at: number;
+}
+
 export class Agent {
   private readonly events = new EventBus();
   private readonly hooks = new HookManager();
@@ -2234,6 +2247,124 @@ export class Agent {
       this.toolDescriptors.push(descriptor);
       this.toolDescriptorIndex.set(descriptor.name, descriptor);
     }
+  }
+
+  // ========== 动态工具集变更 API（PR-1） ==========
+  //
+  // 设计契约（与 kode-agent-platform R-02 对齐，4 个 SDK call point 之一）：
+  //
+  // 1. 数据面三同步：tools(Map) + toolDescriptors(Array) + toolDescriptorIndex(Map) 三者必须保持一致。
+  //    所有变更走 #applyToolMutation()，禁止外部直接动这三个字段。
+  //
+  // 2. 同步 vs 异步：addTools/removeTools/listTools 是同步只动数据面的快通道；
+  //    listPendingMutations/flushToolMutations 是给 native(SkillState) call point 用的事件序列化挂载点，
+  //    backend-core 在 SkillState 变更后通过 flush 触发 SDK 落 history（PR-2 范围）。
+  //
+  // 3. 不影响 in-flight tool calls：变更只对"未来的 LLM 轮次"生效；当前正在 exec 的工具会跑完。
+  //    实现方式：tools Map 删除后，旧的 ToolInstance 引用已被 toolRunner 持有，自然完成。
+  //
+  // 4. 幂等：addTools 同名覆盖（与 registerTodoTools 行为一致），removeTools 不存在的 name 静默忽略。
+
+  /**
+   * 添加或覆盖工具。同步操作，立即对后续 LLM 轮次生效。
+   * 同名工具会被覆盖（参照 registerTodoTools 模式）。
+   * 不影响当前正在 exec 的工具实例。
+   *
+   * @param tools 待添加的工具实例数组
+   * @returns 实际添加（含覆盖）的工具名列表
+   */
+  addTools(tools: ToolInstance[]): string[] {
+    const added: string[] = [];
+    for (const tool of tools) {
+      this.#applyToolMutation({ kind: 'add', tool });
+      added.push(tool.name);
+    }
+    this.#recordPendingMutation({ op: 'add', names: added, at: Date.now() });
+    return added;
+  }
+
+  /**
+   * 按 name 移除工具。同步操作。
+   * 不存在的 name 静默忽略（幂等保证）。
+   * 不影响当前正在 exec 的工具实例。
+   *
+   * @param names 待移除的工具名数组
+   * @returns 实际移除的工具名列表（不含已不存在的）
+   */
+  removeTools(names: string[]): string[] {
+    const removed: string[] = [];
+    for (const name of names) {
+      if (this.tools.has(name)) {
+        this.#applyToolMutation({ kind: 'remove', name });
+        removed.push(name);
+      }
+    }
+    if (removed.length > 0) {
+      this.#recordPendingMutation({ op: 'remove', names: removed, at: Date.now() });
+    }
+    return removed;
+  }
+
+  /**
+   * 列出当前活跃工具描述符。返回快照副本，不暴露内部数组引用。
+   */
+  listTools(): ToolDescriptor[] {
+    return this.toolDescriptors.slice();
+  }
+
+  /**
+   * 列出尚未 flush 到 history 的工具集变更事件。
+   * 用于 R-02 native call point：backend-core 在 SkillState 变更后查询此列表，
+   * 决定是否需要走 flushToolMutations 触发 SDK history 写入。
+   *
+   * 返回快照副本，不暴露内部队列引用。
+   */
+  listPendingMutations(): ReadonlyArray<PendingToolMutation> {
+    return this.#pendingToolMutations.slice();
+  }
+
+  /**
+   * 将 pending 变更事件序列化并清空队列。
+   * R-02 call point：由 backend-core / native SkillState 调用，触发 SDK history 落盘节点。
+   * 返回的事件供调用方组装成 history 记录（具体 history schema 由 PR-2 定）。
+   *
+   * 幂等保证：连续两次调用，第二次返回空数组。
+   *
+   * @returns 自上次 flush 以来累积的 mutation 事件（按时间序）
+   */
+  flushToolMutations(): PendingToolMutation[] {
+    const flushed = this.#pendingToolMutations.slice();
+    this.#pendingToolMutations.length = 0;
+    return flushed;
+  }
+
+  // ---- 内部三同步实现（PR-1 私有路径） ----
+
+  #pendingToolMutations: PendingToolMutation[] = [];
+
+  #applyToolMutation(m: { kind: 'add'; tool: ToolInstance } | { kind: 'remove'; name: string }): void {
+    if (m.kind === 'add') {
+      const tool = m.tool;
+      this.tools.set(tool.name, tool);
+      const descriptor = tool.toDescriptor();
+      // 三同步：descriptors 数组按 name 唯一性原地替换或追加（保持引用稳定，prevent runtime.toolDescriptors 双视图漂移）
+      const idx = this.toolDescriptors.findIndex((d) => d.name === tool.name);
+      if (idx >= 0) {
+        this.toolDescriptors[idx] = descriptor;
+      } else {
+        this.toolDescriptors.push(descriptor);
+      }
+      this.toolDescriptorIndex.set(descriptor.name, descriptor);
+    } else {
+      this.tools.delete(m.name);
+      const idx = this.toolDescriptors.findIndex((d) => d.name === m.name);
+      if (idx >= 0) this.toolDescriptors.splice(idx, 1);
+      this.toolDescriptorIndex.delete(m.name);
+    }
+  }
+
+  #recordPendingMutation(evt: PendingToolMutation): void {
+    this.#pendingToolMutations.push(evt);
   }
 
   // ========== 工具说明书自动注入 ==========
